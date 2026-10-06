@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 namespace llm {
 
@@ -156,6 +157,7 @@ void Transformer::block(int64_t layer, int64_t pos, int64_t bs, float* x_in) {
     const int64_t kv_dim = cfg_.kv_dim_at(layer);
     const int64_t q_dim = cfg_.q_dim_at(layer);
     const int64_t group = n_heads / n_kv;
+    if (group > 64) throw std::runtime_error("attention: more than 64 query heads per KV head");
     const BlockSpec& b = cfg_.block_spec;
     // Weighted RMSNorm for the post/qk norms: Gemma 2/3 store w with the +1
     // offset applied at runtime; Gemma 4 GGUFs store the effective scale.
@@ -299,60 +301,142 @@ void Transformer::block(int64_t layer, int64_t pos, int64_t bs, float* x_in) {
     const float scale = cfg_.attn_scale > 0.f ? cfg_.attn_scale
                       : cfg_.query_pre_attn_scalar > 0.f ? (1.0f / std::sqrt(cfg_.query_pre_attn_scalar))
                                                          : (1.0f / std::sqrt((float)hd));
-    std::vector<float> head_scratch;
-    if (kv_->precision() == KVPrecision::Q8_0) head_scratch.resize(hd);
+    const bool q8kv = kv_->precision() == KVPrecision::Q8_0;
+    const int64_t q8_bytes = type_nbytes(DType::Q8_0, hd);
 
-    for (int64_t i = 0; i < bs; ++i) {
-        int64_t pos_i = pos + i;
+    auto write_kv = [&](int64_t i) {
+        const int64_t pos_i = pos + i;
         float* ki = k_.data() + i * kv_dim;
         float* vi = v_.data() + i * kv_dim;
-
-        if (kv_->precision() == KVPrecision::Q8_0) {
-            const int64_t q8_bytes = type_nbytes(DType::Q8_0, hd);
+        if (q8kv) {
             for (int64_t h = 0; h < n_kv; ++h) {
-                uint8_t* k8 = (uint8_t*)kv_->k_ptr(layer, pos_i) + h * q8_bytes;
-                uint8_t* v8 = (uint8_t*)kv_->v_ptr(layer, pos_i) + h * q8_bytes;
-                quantize_q8_0(ki + h * hd, k8, hd);
-                quantize_q8_0(vi + h * hd, v8, hd);
+                quantize_q8_0(ki + h * hd, (uint8_t*)kv_->k_ptr(layer, pos_i) + h * q8_bytes, hd);
+                quantize_q8_0(vi + h * hd, (uint8_t*)kv_->v_ptr(layer, pos_i) + h * q8_bytes, hd);
             }
         } else {
             std::memcpy(kv_->k_ptr(layer, pos_i), ki, kv_dim * sizeof(float));
             std::memcpy(kv_->v_ptr(layer, pos_i), vi, kv_dim * sizeof(float));
         }
+    };
 
-        float* qi = q_.data() + i * q_dim;
-        float* attn_out_i = attn_out_.data() + i * q_dim;
-        
-        const int64_t start_t = (cfg_.sliding_window > 0 && cfg_.is_swa_layer(layer))
-            ? std::max<int64_t>(0, pos_i - cfg_.sliding_window + 1) : 0;
-        const int64_t window_len = pos_i - start_t + 1;
-        
-        for (int64_t h = 0; h < n_heads; ++h) {
-            const float* qh = qi + h * hd;
-            const int64_t kvh = h / group;
-            for (int64_t t = start_t; t <= pos_i; ++t) {
-                if (kv_->precision() == KVPrecision::Q8_0) {
-                    const uint8_t* k8 = (const uint8_t*)kv_->k_ptr(layer, t) + kvh * type_nbytes(DType::Q8_0, hd);
-                    dequantize_row(DType::Q8_0, k8, head_scratch.data(), hd);
-                    att_[t] = dot_f32(qh, head_scratch.data(), hd) * scale;
-                } else {
-                    att_[t] = dot_f32(qh, (const float*)kv_->k_ptr(layer, t) + kvh * hd, hd) * scale;
-                }
-            }
-            if (b.attn_softcap) softcap_inplace(att_.data() + start_t, window_len, cfg_.attn_logit_softcap);
-            softmax(att_.data() + start_t, window_len);
-            float* out = attn_out_i + h * hd;
-            for (int64_t d = 0; d < hd; ++d) out[d] = 0.f;
-            for (int64_t t = start_t; t <= pos_i; ++t) {
-                if (kv_->precision() == KVPrecision::Q8_0) {
-                    const uint8_t* v8 = (const uint8_t*)kv_->v_ptr(layer, t) + kvh * type_nbytes(DType::Q8_0, hd);
-                    dequantize_row(DType::Q8_0, v8, head_scratch.data(), hd);
-                    axpy_f32(out, head_scratch.data(), att_[t], hd);
-                } else {
-                    axpy_f32(out, (const float*)kv_->v_ptr(layer, t) + kvh * hd, att_[t], hd);
-                }
-            }
+    // Attention, parallel over (token, kv head, time chunk). All `group` query
+    // heads sharing a KV head are processed together so each K/V row is read
+    // from memory once instead of `group` times. Decode (bs=1, often one KV
+    // head) splits the time axis into chunks — flash-decoding — and merges the
+    // per-chunk (max, sum, partial out) with log-sum-exp rescaling.
+    const int64_t win = cfg_.sliding_window > 0 && cfg_.is_swa_layer(layer) ? cfg_.sliding_window : 0;
+    auto span_of = [&](int64_t i, int64_t& t0, int64_t& len) {
+        const int64_t pos_i = pos + i;
+        t0 = win > 0 ? std::max<int64_t>(0, pos_i - win + 1) : 0;
+        len = pos_i - t0 + 1;
+    };
+    const int n_thr = pool_ ? pool_->size() : 1;
+    auto attend = [&](int64_t ib, int64_t ie) {
+            int64_t max_len = 1;
+        for (int64_t i = ib; i < ie; ++i) { int64_t t0, len; span_of(i, t0, len); max_len = std::max(max_len, len); }
+        const int64_t base_items = (ie - ib) * n_kv;
+        int64_t n_chunks = 1;
+        if (n_thr > 1 && base_items < 2 * n_thr) {
+            n_chunks = (2 * n_thr + base_items - 1) / base_items;
+            n_chunks = std::max<int64_t>(1, std::min(n_chunks, max_len / 64));   // >= 64 positions per chunk
         }
+        const int64_t n_items = base_items * n_chunks;
+        const int64_t part_stride = group * (hd + 2);                          // [m, l, out[hd]] per head
+        if (n_chunks > 1 && (int64_t)attn_part_.size() < n_items * part_stride)
+            attn_part_.resize(n_items * part_stride);
+        if ((int)attn_scratch_.size() < n_thr) attn_scratch_.resize(n_thr);
+
+        auto work = [&](int tid, int64_t begin, int64_t end) {
+            std::vector<float>& scr = attn_scratch_[tid];
+            for (int64_t it = begin; it < end; ++it) {
+                const int64_t c = it % n_chunks;
+                const int64_t kvh = (it / n_chunks) % n_kv;
+                const int64_t i = ib + it / (n_chunks * n_kv);
+                int64_t t0, len;
+                span_of(i, t0, len);
+                const int64_t clen = (len + n_chunks - 1) / n_chunks;
+                const int64_t a0 = t0 + c * clen;
+                const int64_t a1 = std::min(t0 + len, a0 + clen);
+                const int64_t n = std::max<int64_t>(0, a1 - a0);
+                const size_t need = (size_t)(group * std::max<int64_t>(n, 1) + (q8kv ? hd : 0));
+                if (scr.size() < need) scr.resize(need);
+                float* sc = scr.data();                        // [group][n] scores
+                float* row = scr.data() + group * std::max<int64_t>(n, 1);   // dequant row
+                const float* qg = q_.data() + i * q_dim + kvh * group * hd;
+                for (int64_t t = a0; t < a1; ++t) {
+                    const float* kr;
+                    if (q8kv) { dequantize_row(DType::Q8_0, (const uint8_t*)kv_->k_ptr(layer, t) + kvh * q8_bytes, row, hd); kr = row; }
+                    else kr = (const float*)kv_->k_ptr(layer, t) + kvh * hd;
+                    for (int64_t g = 0; g < group; ++g) sc[g * n + (t - a0)] = dot_f32(qg + g * hd, kr, hd) * scale;
+                }
+                float m[64], l[64];                            // group <= 64 for every supported arch
+                for (int64_t g = 0; g < group; ++g) {
+                    float* sg = sc + g * n;
+                    if (b.attn_softcap) softcap_inplace(sg, n, cfg_.attn_logit_softcap);
+                    float mx = -INFINITY, sum = 0.f;
+                    for (int64_t t = 0; t < n; ++t) mx = sg[t] > mx ? sg[t] : mx;
+                    for (int64_t t = 0; t < n; ++t) { sg[t] = std::exp(sg[t] - mx); sum += sg[t]; }
+                    m[g] = mx; l[g] = sum;
+                }
+                float* outs[64];
+                for (int64_t g = 0; g < group; ++g) {
+                    outs[g] = n_chunks > 1 ? attn_part_.data() + it * part_stride + g * (hd + 2) + 2
+                                           : attn_out_.data() + i * q_dim + (kvh * group + g) * hd;
+                    std::fill(outs[g], outs[g] + hd, 0.f);
+                }
+                for (int64_t t = a0; t < a1; ++t) {
+                    const float* vr;
+                    if (q8kv) { dequantize_row(DType::Q8_0, (const uint8_t*)kv_->v_ptr(layer, t) + kvh * q8_bytes, row, hd); vr = row; }
+                    else vr = (const float*)kv_->v_ptr(layer, t) + kvh * hd;
+                    for (int64_t g = 0; g < group; ++g) axpy_f32(outs[g], vr, sc[g * n + (t - a0)], hd);
+                }
+                for (int64_t g = 0; g < group; ++g) {
+                    if (n_chunks > 1) {
+                        float* p = attn_part_.data() + it * part_stride + g * (hd + 2);
+                        p[0] = m[g]; p[1] = l[g];
+                    } else {
+                        const float inv = l[g] > 0.f ? 1.f / l[g] : 0.f;
+                        for (int64_t d = 0; d < hd; ++d) outs[g][d] *= inv;
+                    }
+                }
+            }
+        };
+        if (pool_ && n_thr > 1 && n_items > 1) pool_->parallel_for(n_items, work);
+        else work(0, 0, n_items);
+
+        if (n_chunks > 1) {
+            for (int64_t i = ib; i < ie; ++i)
+                for (int64_t kvh = 0; kvh < n_kv; ++kvh)
+                    for (int64_t g = 0; g < group; ++g) {
+                        const int64_t it0 = ((i - ib) * n_kv + kvh) * n_chunks;
+                        float M = -INFINITY;
+                        for (int64_t c = 0; c < n_chunks; ++c) {
+                            const float* p = attn_part_.data() + (it0 + c) * part_stride + g * (hd + 2);
+                            if (p[1] > 0.f && p[0] > M) M = p[0];
+                        }
+                        float* out = attn_out_.data() + i * q_dim + (kvh * group + g) * hd;
+                        std::fill(out, out + hd, 0.f);
+                        float L = 0.f;
+                        for (int64_t c = 0; c < n_chunks; ++c) {
+                            const float* p = attn_part_.data() + (it0 + c) * part_stride + g * (hd + 2);
+                            if (!(p[1] > 0.f)) continue;
+                            const float w = std::exp(p[0] - M);
+                            L += w * p[1];
+                            axpy_f32(out, p + 2, w, hd);
+                        }
+                        const float inv = L > 0.f ? 1.f / L : 0.f;
+                        for (int64_t d = 0; d < hd; ++d) out[d] *= inv;
+                    }
+        }
+    };
+    // A ring (sliding-window) layer holds exactly W rows, so writing token
+    // i+1 can evict a row token i still needs: write and attend one token at a
+    // time there. Full-cache layers write the whole batch, then attend at once.
+    if (kv_->window(layer) > 0) {
+        for (int64_t i = 0; i < bs; ++i) { write_kv(i); attend(i, i + 1); }
+    } else {
+        for (int64_t i = 0; i < bs; ++i) write_kv(i);
+        attend(0, bs);
     }
 
     // --- 7. Attention Out Projection ---
