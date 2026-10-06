@@ -8,6 +8,7 @@
 // answer is produced.
 #include "llm/nishachar.h"
 #include "llm/runtime.h"
+#include "llm/cuda_backend.h"
 #include "llm/sampler.h"
 #include "llm/tools.h"
 
@@ -55,6 +56,7 @@ static void print_usage(const char* prog) {
             "  --temp T         Sampling temperature (default: 0.0 for deterministic tools)\n"
             "  --fast           int8-activation SIMD kernels (Q8_0, Q4_K/Q5_K/Q6_K)\n"
             "  --ram-budget B   total peak-RSS target, e.g. 14G (pins layers resident)\n"
+            "  --gpu-layers N   offload N layers' projections to an NVIDIA GPU (max = fit)\n"
             "  --max-new N      max tokens generated per step (default: 2048)\n"
             "  --tool-timeout S kill a bash command after S seconds (default: 600)\n"
             "  --tool-cap N     max chars of tool output fed back (default: 6000)\n"
@@ -290,6 +292,7 @@ int main(int argc, char** argv) {
     int ctx = 0;
     float temp = 0.0f;
     bool fast = false;
+    int gpu_layers = 0;
     size_t ram_budget = 0;
     int max_new = 2048, tool_timeout = 600;
     size_t tool_cap = 6000;
@@ -313,6 +316,8 @@ int main(int argc, char** argv) {
             temp = std::stof(argv[++i]);
         } else if (a == "--fast") {
             fast = true;
+        } else if (a == "--gpu-layers" && i + 1 < argc) {
+            gpu_layers = llm::cuda::parse_gpu_layers(argv[++i]);
         } else if (a == "--ram-budget" && i + 1 < argc) {
             std::string v = argv[++i];
             double x = std::stod(v);
@@ -363,6 +368,7 @@ int main(int argc, char** argv) {
         LayerLoader::Options opt;
         opt.residency = Residency::Quantized;
         opt.fast_quant = fast;
+        opt.gpu_layers = gpu_layers;
         Runtime rt(std::move(src), opt, ctx, threads, ram_budget);
 
         printf("[Model Loaded] Arch: %s | Layers: %lld | Dim: %lld\n",
