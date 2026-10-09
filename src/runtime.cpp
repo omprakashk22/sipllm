@@ -193,6 +193,11 @@ std::string Runtime::generate(const std::string& prompt, int max_new,
         committed_.insert(committed_.end(),
                           prompt_ids.begin() + reuse_r, prompt_ids.end());
         first_logits_.assign(logits, logits + vocab);
+        if (logit_filter_) {
+            filtered_logits_.assign(logits, logits + vocab);
+            logit_filter_(filtered_logits_.data(), vocab);
+            logits = filtered_logits_.data();
+        }
         next = sampler.sample(logits, vocab);
     }
     if (rtk) rtk->on_prefill(kv_view());
@@ -219,6 +224,11 @@ std::string Runtime::generate(const std::string& prompt, int max_new,
         ++pos_;
         if (rtk) rtk->on_step(kv_view());
         if (profile_sink_) profile_sink_(n, tf_->last_timings(), tf_->peak_rss());
+        if (logit_filter_) {
+            filtered_logits_.assign(logits, logits + vocab);
+            logit_filter_(filtered_logits_.data(), vocab);
+            logits = filtered_logits_.data();
+        }
         next = sampler.sample(logits, vocab);
     }
     if (profile_sink_) tf_->enable_profiling(false);
