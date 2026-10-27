@@ -10,7 +10,7 @@
 # ~/.sipllm/models, and hands it to the engine binary (which STREAMS the weights
 # off disk — so even a model larger than RAM runs). Add your own models with a
 # line "name<TAB>url" in ~/.sipllm/registry.conf, or just pass a URL / path.
-set -euo pipefail
+set -eu
 
 SIPLLM_HOME="${SIPLLM_HOME:-$HOME/.sipllm}"
 MODELS_DIR="$SIPLLM_HOME/models"
